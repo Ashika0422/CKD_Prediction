@@ -14,11 +14,13 @@ import os
 warnings.filterwarnings('ignore')
 
 from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.impute import KNNImputer
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
+from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import mutual_info_classif
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score, 
                              confusion_matrix, classification_report, roc_curve, auc, roc_auc_score)
 
@@ -39,6 +41,9 @@ class CKDClassifier:
         self.pca = None
         self.best_model = None
         self.feature_names = None
+        self.numeric_cols = []
+        self.categorical_cols = []
+        self.preprocessor = None
         
     def _manual_arff_parse(self, filepath):
         """Manual ARFF parser as fallback"""
@@ -191,12 +196,12 @@ class CKDClassifier:
             plt.close()
     
     def preprocess_data(self, numeric_cols, categorical_cols):
-        """Clean and preprocess the data"""
+        """Clean and prepare the data (no imputation or encoding yet)"""
         print("\n" + "="*80 + "\n4. DATA PREPROCESSING\n" + "="*80)
         
         df_clean = self.df.replace('?', np.nan).copy()
         
-        # Convert numeric columns
+        # Convert numeric columns to proper numeric type
         for col in numeric_cols:
             df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
         
@@ -209,30 +214,23 @@ class CKDClassifier:
         y_encoded = le_target.fit_transform(y.astype(str))
         self.label_encoders['class'] = le_target
         
-        # Encode categorical features using factorize
-        X_encoded = X.copy()
-        for col in categorical_cols:
-            if col in X_encoded.columns:
-                codes, _ = pd.factorize(X_encoded[col].astype(str))
-                X_encoded[col] = codes
-                X_encoded[col] = X_encoded[col].replace(-1, np.nan)
+        # Store column names for later
+        self.numeric_cols = numeric_cols
+        self.categorical_cols = categorical_cols
         
-        # Impute missing values using KNN
-        print("\n⚙️  Imputing missing values with KNN (k=5)...")
-        imputer = KNNImputer(n_neighbors=5)
-        X_imputed = pd.DataFrame(imputer.fit_transform(X_encoded), columns=X.columns)
+        print(f"✓ Data cleaned. Shape: {X.shape}")
+        print(f"✓ Numeric features: {len(numeric_cols)}")
+        print(f"✓ Categorical features: {len(categorical_cols)}")
+        print(f"✓ Missing values: {X.isnull().sum().sum()}")
+        print("   (Will be imputed after train/test split to prevent leakage)")
         
-        self.feature_names = X_imputed.columns.tolist()
-        print(f"✓ Preprocessing complete. Shape: {X_imputed.shape}")
-        print(f"✓ Missing values after imputation: {X_imputed.isnull().sum().sum()}")
-        
-        return X_imputed, y_encoded
+        return X, y_encoded
     
     def split_and_scale(self, X, y, test_size=0.2):
-        """Split data and apply feature scaling"""
-        print("\n" + "="*80 + "\n5. TRAIN-TEST SPLIT & SCALING\n" + "="*80)
+        """Split data and create preprocessing pipeline (fit only on training data)"""
+        print("\n" + "="*80 + "\n5. TRAIN-TEST SPLIT & PREPROCESSING PIPELINE\n" + "="*80)
         
-        # CRITICAL: Split BEFORE scaling to prevent data leakage
+        # CRITICAL: Split BEFORE any preprocessing to prevent data leakage
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
             X, y, test_size=test_size, random_state=RANDOM_STATE, stratify=y
         )
@@ -240,37 +238,81 @@ class CKDClassifier:
         print(f"✓ Train set: {self.X_train.shape[0]} samples")
         print(f"✓ Test set:  {self.X_test.shape[0]} samples")
         
-        # Scale features based on training data only
-        self.scaler = StandardScaler()
-        self.X_train = pd.DataFrame(
-            self.scaler.fit_transform(self.X_train), 
-            columns=self.feature_names,
-            index=self.X_train.index
-        )
-        self.X_test = pd.DataFrame(
-            self.scaler.transform(self.X_test), 
-            columns=self.feature_names,
-            index=self.X_test.index
-        )
+        # Create preprocessing pipeline
+        print("\n⚙️  Creating preprocessing pipeline...")
         
-        print("✓ Feature scaling applied (StandardScaler)")
+        # Numeric features: impute with KNN, then scale
+        numeric_transformer = Pipeline(steps=[
+            ('imputer', KNNImputer(n_neighbors=5)),
+            ('scaler', StandardScaler())
+        ])
+        
+        # Categorical features: impute with most frequent, then one-hot encode
+        categorical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'))
+        ])
+        
+        # Combine transformers
+        self.preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', numeric_transformer, self.numeric_cols),
+                ('cat', categorical_transformer, self.categorical_cols)
+            ])
+        
+        # Fit preprocessor on training data ONLY
+        print("✓ Fitting preprocessor on training data only...")
+        self.X_train = self.preprocessor.fit_transform(self.X_train)
+        self.X_test = self.preprocessor.transform(self.X_test)
+        
+        # Get feature names after transformation
+        num_features = self.numeric_cols
+        try:
+            cat_features = self.preprocessor.named_transformers_['cat']['onehot'].get_feature_names_out(self.categorical_cols)
+        except:
+            cat_features = []
+        self.feature_names = list(num_features) + list(cat_features)
+        
+        print(f"✓ Preprocessing complete")
+        print(f"   - Original features: {len(self.numeric_cols) + len(self.categorical_cols)}")
+        print(f"   - After one-hot encoding: {self.X_train.shape[1]}")
+        print(f"   - Missing values in train: 0 (imputed)")
+        print(f"   - Missing values in test: 0 (imputed)")
     
     def feature_importance(self):
         """Analyze feature importance using mutual information"""
         print("\n" + "="*80 + "\n6. FEATURE IMPORTANCE ANALYSIS\n" + "="*80)
         
-        mi_scores = pd.Series(
-            mutual_info_classif(self.X_train, self.y_train, random_state=RANDOM_STATE),
-            index=self.feature_names
-        ).sort_values(ascending=False)
+        mi_scores = mutual_info_classif(self.X_train, self.y_train, random_state=RANDOM_STATE)
+        
+        # Use simplified feature names (original numeric + categorical indicators)
+        feature_labels = self.numeric_cols + self.categorical_cols
+        if len(mi_scores) > len(feature_labels):
+            # More features due to one-hot encoding, use first N for display
+            mi_aggregated = []
+            idx = 0
+            for i, col in enumerate(self.numeric_cols):
+                mi_aggregated.append((col, mi_scores[idx]))
+                idx += 1
+            for col in self.categorical_cols:
+                # Sum MI scores for all one-hot columns from this categorical feature
+                n_categories = len([f for f in self.feature_names if f.startswith(col)])
+                if n_categories == 0:
+                    n_categories = 1
+                scores_sum = sum(mi_scores[idx:idx+n_categories])
+                mi_aggregated.append((col, scores_sum))
+                idx += n_categories
+            mi_series = pd.Series(dict(mi_aggregated)).sort_values(ascending=False)
+        else:
+            mi_series = pd.Series(mi_scores, index=feature_labels[:len(mi_scores)]).sort_values(ascending=False)
         
         print("\n🎯 Top 10 Most Important Features:")
-        for i, (feature, score) in enumerate(mi_scores.head(10).items(), 1):
+        for i, (feature, score) in enumerate(mi_series.head(10).items(), 1):
             print(f"   {i:2d}. {feature:15s} : {score:.4f}")
         
         # Plot
         fig, ax = plt.subplots(figsize=(10, 8))
-        mi_scores.sort_values().plot(kind='barh', ax=ax, color='steelblue')
+        mi_series.sort_values().plot(kind='barh', ax=ax, color='steelblue')
         ax.set_title('Feature Importance (Mutual Information)', 
                     fontsize=16, fontweight='bold')
         ax.set_xlabel('Mutual Information Score', fontweight='bold')
@@ -279,40 +321,45 @@ class CKDClassifier:
         print("\n✓ Saved: feature_importance.png")
         plt.close()
     
-    def evaluate_k_parameter(self, X_train, X_test, k_range=range(1, 31)):
+    def evaluate_k_parameter(self, X_train, k_range=range(1, 31)):
         """
         KEY REQUIREMENT: Evaluate effect of k on classification accuracy
+        Uses cross-validation on TRAINING data only (no test set peeking)
         """
         print("\n" + "="*80 + "\n7. K-PARAMETER ANALYSIS (Assignment Requirement)\n" + "="*80)
         
         train_scores = []
-        test_scores = []
+        cv_scores = []
         
-        print("\n⚙️  Testing k values from 1 to 30...")
+        print("\n⚙️  Testing k values from 1 to 30 using 5-fold CV...")
         for k in k_range:
             knn = KNeighborsClassifier(n_neighbors=k)
+            # Training accuracy
             knn.fit(X_train, self.y_train)
             train_scores.append(accuracy_score(self.y_train, knn.predict(X_train)))
-            test_scores.append(accuracy_score(self.y_test, knn.predict(X_test)))
+            # Cross-validation accuracy on training set
+            cv_score = cross_val_score(knn, X_train, self.y_train, cv=5, scoring='accuracy')
+            cv_scores.append(cv_score.mean())
         
-        best_k = k_range[np.argmax(test_scores)]
-        best_acc = max(test_scores)
+        best_k = k_range[np.argmax(cv_scores)]
+        best_cv_acc = max(cv_scores)
         
-        print(f"\n🏆 BEST k VALUE: {best_k}")
-        print(f"   Test Accuracy: {best_acc*100:.2f}%")
+        print(f"\n🏆 BEST k VALUE (based on CV): {best_k}")
+        print(f"   CV Accuracy: {best_cv_acc*100:.2f}%")
         print(f"   Train Accuracy: {train_scores[best_k-1]*100:.2f}%")
+        print(f"\n✓ No test set was used in k selection (preventing leakage)")
         
         # Detailed plot
         fig, ax = plt.subplots(figsize=(12, 7))
         ax.plot(k_range, [s*100 for s in train_scores], 
                label='Training Accuracy', marker='o', linewidth=2, markersize=6)
-        ax.plot(k_range, [s*100 for s in test_scores], 
-               label='Test Accuracy', marker='s', linewidth=2, markersize=6)
+        ax.plot(k_range, [s*100 for s in cv_scores], 
+               label='Cross-Validation Accuracy', marker='s', linewidth=2, markersize=6)
         ax.axvline(x=best_k, color='red', linestyle='--', linewidth=2,
                   label=f'Best k = {best_k}')
         ax.set_xlabel('k (Number of Neighbors)', fontsize=12, fontweight='bold')
         ax.set_ylabel('Accuracy (%)', fontsize=12, fontweight='bold')
-        ax.set_title('Effect of k Parameter on Classification Accuracy', 
+        ax.set_title('Effect of k Parameter on Classification Accuracy (5-Fold CV)', 
                     fontsize=16, fontweight='bold')
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
@@ -321,75 +368,70 @@ class CKDClassifier:
         print("\n✓ Saved: k_value_analysis.png")
         plt.close()
         
-        return best_k, best_acc
+        return best_k, best_cv_acc
     
     def compare_dimensionality_reduction(self):
-        """Compare performance with and without PCA"""
+        """Compare performance with and without PCA using CV on training data only"""
         print("\n" + "="*80 + "\n8. DIMENSIONALITY REDUCTION (PCA)\n" + "="*80)
         
         results = {}
         
         # 1. Baseline (No PCA)
         print("\n📊 Evaluating WITHOUT PCA...")
-        best_k_no_pca, acc_no_pca = self.evaluate_k_parameter(
-            self.X_train, self.X_test, range(1, 21)
+        best_k_no_pca, cv_acc_no_pca = self.evaluate_k_parameter(
+            self.X_train, range(1, 21)
         )
         results['no_pca'] = {
-            'accuracy': acc_no_pca,
+            'cv_accuracy': cv_acc_no_pca,
             'best_k': best_k_no_pca,
             'n_features': self.X_train.shape[1]
         }
         
-        # 2. PCA with 95% variance
+        # 2. PCA with 95% variance (fit on training data only)
         print("\n📊 Evaluating WITH PCA (95% variance)...")
-        pca = PCA(n_components=0.95, random_state=RANDOM_STATE)
-        X_train_pca = pca.fit_transform(self.X_train)
-        X_test_pca = pca.transform(self.X_test)
+        self.pca = PCA(n_components=0.95, random_state=RANDOM_STATE)
+        X_train_pca = self.pca.fit_transform(self.X_train)
         
-        best_k_pca, acc_pca = self.evaluate_k_parameter(
-            X_train_pca, X_test_pca, range(1, 21)
+        best_k_pca, cv_acc_pca = self.evaluate_k_parameter(
+            X_train_pca, range(1, 21)
         )
         results['pca_95'] = {
-            'accuracy': acc_pca,
+            'cv_accuracy': cv_acc_pca,
             'best_k': best_k_pca,
-            'n_features': pca.n_components_,
-            'variance_explained': np.sum(pca.explained_variance_ratio_)
+            'n_features': self.pca.n_components_,
+            'variance_explained': np.sum(self.pca.explained_variance_ratio_)
         }
         
         # Summary
         print("\n" + "="*60)
-        print("DIMENSIONALITY REDUCTION COMPARISON:")
+        print("DIMENSIONALITY REDUCTION COMPARISON (CV on training set):")
         print("="*60)
-        print(f"{'Method':<20} {'Features':<12} {'Best k':<10} {'Accuracy':<12}")
+        print(f"{'Method':<20} {'Features':<12} {'Best k':<10} {'CV Accuracy':<12}")
         print("-"*60)
         print(f"{'Original (No PCA)':<20} {results['no_pca']['n_features']:<12} "
-              f"{results['no_pca']['best_k']:<10} {results['no_pca']['accuracy']*100:<11.2f}%")
+              f"{results['no_pca']['best_k']:<10} {results['no_pca']['cv_accuracy']*100:<11.2f}%")
         print(f"{'PCA (95% var)':<20} {results['pca_95']['n_features']:<12} "
-              f"{results['pca_95']['best_k']:<10} {results['pca_95']['accuracy']*100:<11.2f}%")
+              f"{results['pca_95']['best_k']:<10} {results['pca_95']['cv_accuracy']*100:<11.2f}%")
         print("="*60)
-        
-        # Save PCA for final model
-        self.pca = pca
         
         # Visualization
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
         
         # Comparison bar chart
         methods = ['No PCA', 'PCA (95%)']
-        accuracies = [results['no_pca']['accuracy']*100, results['pca_95']['accuracy']*100]
-        features = [results['no_pca']['n_features'], results['pca_95']['n_features']]
+        accuracies = [results['no_pca']['cv_accuracy']*100, results['pca_95']['cv_accuracy']*100]
         
         bars = axes[0].bar(methods, accuracies, color=['#3498db', '#e67e22'], 
                           edgecolor='black', linewidth=1.5)
-        axes[0].set_ylabel('Accuracy (%)', fontweight='bold')
-        axes[0].set_title('Accuracy Comparison', fontsize=14, fontweight='bold')
+        axes[0].set_ylabel('CV Accuracy (%)', fontweight='bold')
+        axes[0].set_title('CV Accuracy Comparison', fontsize=14, fontweight='bold')
         axes[0].set_ylim([min(accuracies)-5, 100])
         for bar, acc in zip(bars, accuracies):
             axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
                         f'{acc:.2f}%', ha='center', fontweight='bold')
         
         # PCA variance explained
-        cumsum = np.cumsum(pca.explained_variance_ratio_)
+        cumsum = np.cumsum(self.pca.explained_variance_ratio_)
         axes[1].plot(range(1, len(cumsum)+1), cumsum*100, marker='o', linewidth=2)
         axes[1].axhline(y=95, color='red', linestyle='--', label='95% threshold')
         axes[1].set_xlabel('Number of Components', fontweight='bold')
@@ -403,22 +445,33 @@ class CKDClassifier:
         print("\n✓ Saved: pca_comparison.png")
         plt.close()
         
-        # Return the better performing configuration
-        if acc_pca >= acc_no_pca:
-            print(f"\n✓ Using PCA-reduced features for final model")
-            return X_train_pca, X_test_pca, best_k_pca
+        # Return the better performing configuration based on CV
+        if cv_acc_pca >= cv_acc_no_pca:
+            print(f"\n✓ PCA selected based on CV performance")
+            print(f"   Will transform test set at final evaluation")
+            return 'pca', best_k_pca
         else:
-            print(f"\n✓ Using original features for final model")
-            return self.X_train, self.X_test, best_k_no_pca
+            print(f"\n✓ Original features selected based on CV performance")
+            return 'no_pca', best_k_no_pca
     
-    def final_model_evaluation(self, X_train, X_test, best_k):
-        """Train and evaluate the final optimized model"""
+    def final_model_evaluation(self, use_pca, best_k):
+        """Train and evaluate the final optimized model on held-out test set"""
         print("\n" + "="*80 + "\n9. FINAL MODEL TRAINING & EVALUATION\n" + "="*80)
+        print("\n🔒 Using held-out test set for final evaluation (first time)")
         
-        # Hyperparameter tuning with GridSearch (optimized for speed)
-        print("\n⚙️  Performing hyperparameter tuning...")
+        # Apply PCA to test set if needed
+        if use_pca == 'pca':
+            print("   Applying PCA transformation to test set...")
+            X_train_final = self.pca.transform(self.X_train)
+            X_test_final = self.pca.transform(self.X_test)
+        else:
+            X_train_final = self.X_train
+            X_test_final = self.X_test
+        
+        # Fine-tune hyperparameters using GridSearch on training data
+        print("\n⚙️  Final hyperparameter tuning on training set...")
         param_grid = {
-            'n_neighbors': [max(1, best_k-1), best_k, best_k+1],
+            'n_neighbors': [max(1, best_k-1), best_k, min(best_k+1, len(self.y_train))],
             'weights': ['uniform', 'distance'],
             'metric': ['euclidean', 'manhattan'],
         }
@@ -426,22 +479,22 @@ class CKDClassifier:
         grid_search = GridSearchCV(
             KNeighborsClassifier(),
             param_grid,
-            cv=3,  # Reduced from 5 for faster execution
+            cv=5,
             scoring='accuracy',
-            n_jobs=-1,
-            verbose=1  # Show progress
+            n_jobs=-1
         )
-        grid_search.fit(X_train, self.y_train)
+        grid_search.fit(X_train_final, self.y_train)
         
         self.best_model = grid_search.best_estimator_
         
         print(f"\n🏆 BEST MODEL PARAMETERS:")
         for param, value in grid_search.best_params_.items():
             print(f"   {param}: {value}")
+        print(f"\n   Best CV score: {grid_search.best_score_*100:.2f}%")
         
-        # Predictions
-        y_pred = self.best_model.predict(X_test)
-        y_pred_proba = self.best_model.predict_proba(X_test)
+        # Predictions on test set
+        y_pred = self.best_model.predict(X_test_final)
+        y_pred_proba = self.best_model.predict_proba(X_test_final)
         
         # Calculate metrics
         accuracy = accuracy_score(self.y_test, y_pred)
@@ -551,19 +604,22 @@ def main():
     # Initialize classifier
     ckd = CKDClassifier(data_path='chronic_kidney_disease_full.arff')
     
-    # Pipeline
+    # Pipeline - ensuring no data leakage
     ckd.load_data()
     numeric_cols, categorical_cols = ckd.exploratory_data_analysis()
     ckd.visualize_data(numeric_cols, categorical_cols)
     X, y = ckd.preprocess_data(numeric_cols, categorical_cols)
+    
+    # CRITICAL: Split first, then fit preprocessing on training data only
     ckd.split_and_scale(X, y, test_size=0.2)
+    
     ckd.feature_importance()
     
-    # Compare with/without PCA and get best configuration
-    X_train_final, X_test_final, best_k = ckd.compare_dimensionality_reduction()
+    # Compare with/without PCA using CV (no test set peeking)
+    use_pca, best_k = ckd.compare_dimensionality_reduction()
     
-    # Final evaluation
-    results = ckd.final_model_evaluation(X_train_final, X_test_final, best_k)
+    # Final evaluation on test set (first and only time)
+    results = ckd.final_model_evaluation(use_pca, best_k)
     
     # Summary
     print("\n" + "="*80)
